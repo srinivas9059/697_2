@@ -57,6 +57,28 @@ export default function ChatPage() {
   const [allTools, setAllTools] = useState<any[] | null>(null);
   const [cachedCategory, setCachedCategory] = useState<string | null>(null);
 
+  async function fetchHuggingFaceModels(category: string) {
+    const categoryToPipelineTag: Record<string, string> = {
+      "Writing / Content Creation": "text-generation",
+      "Coding / Development": "text-generation",
+      "Instruction / Learning": "text2text-generation",
+      "Research / Information Retrieval": "question-answering",
+      "Creative Generation": "text-generation",
+      "Conversation / Chat": "conversational",
+      "Data Analysis": "tabular-classification", // adjust as needed
+      "Multimodal (Image / Audio) Tasks": "multimodal",
+    };
+
+    const pipelineTag = categoryToPipelineTag[category] ?? "text-generation";
+
+    const res = await fetch(
+      `https://huggingface.co/api/models?pipeline_tag=${pipelineTag}&limit=12`
+    );
+
+    const models = await res.json();
+    return models;
+  }
+
   let toolCache: any[] | null = null;
   // Show 3 more LLMs
   async function handleShowMoreLLMs() {
@@ -289,13 +311,21 @@ export default function ChatPage() {
     if (stage === "onboarding" && currentChat && userId) {
       const welcomeMsg: Message = {
         role: "ai",
-        text: "Welcome! Are you ready to start picking the perfect LLM for your task?",
+        text: JSON.stringify({
+          type: "welcome_and_menu",
+          text: "Welcome! Are you ready to start picking the perfect LLM for your task?",
+        }),
         timestamp: Date.now(),
       };
 
       // 1) Persist it to Firestore using your existing helper
       addMessage(userId, currentChat.id, welcomeMsg).catch(console.error);
-
+      const welcomeToolsMsg: Message = {
+        role: "ai",
+        text: JSON.stringify({ type: "welcome_menu" }),
+        timestamp: Date.now(),
+      };
+      addMessage(userId, currentId, welcomeToolsMsg).catch(console.error);
       // 2) Update the conversations state so the UI shows the new message
       setConversations((prev) =>
         prev.map((c) =>
@@ -366,6 +396,41 @@ export default function ChatPage() {
 
     // 2) Clear the input immediately
     setInput("");
+    if (stage === "awaitHuggingfacePrompt") {
+      setStage("idle");
+      setInput("");
+      setLoading(true);
+
+      const userPrompt = text;
+      const category = await classifyViaApi(userPrompt); // reuse your classifier
+      const models = await fetchHuggingFaceModels(category); // ✅ fetch from HF
+      const top3 = models.slice(0, 3);
+
+      const botMsg: Message = {
+        role: "ai",
+        text: JSON.stringify({
+          type: "huggingface_models",
+          category,
+          models: top3.map((m: any) => ({
+            id: m.modelId || m.id, // support both HF APIs
+            downloads: m.downloads,
+            likes: m.likes,
+            tags: m.tags,
+          })),
+        }),
+        timestamp: Date.now(),
+      };
+
+      await addMessage(userId!, currentId!, botMsg);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentId ? { ...c, messages: [...c.messages, botMsg] } : c
+        )
+      );
+
+      setLoading(false);
+      return;
+    }
 
     // ─── Stage 1: Onboarding Yes/No ──────────────────────────────
     if (stage === "awaitStartConfirm") {
@@ -666,7 +731,6 @@ If there is another model in our catalog that fits even better, please recommend
               >
                 {isLLMCardMessage(m) ? (
                   <>
-                    {/* LLM suggestion cards */}
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       {JSON.parse(m.text).models.map(
                         (model: any, j: number) => (
@@ -699,8 +763,6 @@ If there is another model in our catalog that fits even better, please recommend
                         )
                       )}
                     </div>
-
-                    {/* Four‐button menu for LLM flow */}
                     {stage === "awaitLLMAction" && (
                       <LLMOptions
                         onShowMore={handleShowMoreLLMs}
@@ -712,7 +774,6 @@ If there is another model in our catalog that fits even better, please recommend
                   </>
                 ) : isToolCardMessage(m) ? (
                   <>
-                    {/* Tool suggestion cards */}
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       {JSON.parse(m.text).tools.map((tool: any, j: number) => (
                         <div
@@ -736,8 +797,6 @@ If there is another model in our catalog that fits even better, please recommend
                         </div>
                       ))}
                     </div>
-
-                    {/* Two‐button menu for Tool flow */}
                     {stage === "awaitToolAction" && (
                       <div className="flex flex-wrap gap-3 mt-4">
                         <button
@@ -756,17 +815,100 @@ If there is another model in our catalog that fits even better, please recommend
                     )}
                   </>
                 ) : (
-                  // Regular text messages
-                  <span className="inline-block bg-gray-700 px-3 py-1 rounded">
-                    {m.text}
-                  </span>
+                  (() => {
+                    try {
+                      const parsed = JSON.parse(m.text);
+
+                      if (parsed.type === "huggingface_models") {
+                        console.log("Hugging Face payload:", parsed.models);
+
+                        return (
+                          <>
+                            <h3 className="text-lg font-bold mb-2">
+                              Top Hugging Face Models for: {parsed.category}
+                            </h3>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                              {parsed.models.map((model: any, j: number) => (
+                                <div
+                                  key={j}
+                                  className="bg-gray-800 text-white p-4 rounded-lg shadow-lg border border-gray-700"
+                                >
+                                  <h4 className="font-bold text-lg mb-1">
+                                    {model.id}
+                                  </h4>
+                                  <p className="text-sm text-gray-300 mb-1">
+                                    Tags:{" "}
+                                    {model.tags?.slice(0, 3).join(", ") ||
+                                      "N/A"}
+                                  </p>
+                                  <p className="text-sm text-gray-400">
+                                    🔥 {model.downloads ?? 0} downloads | ❤️{" "}
+                                    {model.likes ?? 0} likes
+                                  </p>
+                                  <a
+                                    href={`https://huggingface.co/${model.id}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-blue-400 hover:underline text-sm mt-2 inline-block"
+                                  >
+                                    ↗ Try on Hugging Face
+                                  </a>
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        );
+                      }
+
+                      if (parsed.type === "welcome_and_menu") {
+                        return (
+                          <>
+                            <span className="inline-block bg-gray-700 px-3 py-1 rounded">
+                              {parsed.text}
+                            </span>
+                            <div className="mt-2 flex gap-2">
+                              <button
+                                onClick={() => {
+                                  setStage("awaitHuggingfacePrompt");
+                                  const hint: Message = {
+                                    role: "ai",
+                                    text: "Sure! What kind of AI model are you searching for?",
+                                    timestamp: Date.now(),
+                                  };
+                                  addMessage(userId!, currentId!, hint);
+                                  setConversations((prev) =>
+                                    prev.map((c) =>
+                                      c.id === currentId
+                                        ? {
+                                            ...c,
+                                            messages: [...c.messages, hint],
+                                          }
+                                        : c
+                                    )
+                                  );
+                                }}
+                                className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700"
+                              >
+                                🔍 Search on Hugging Face
+                              </button>
+                            </div>
+                          </>
+                        );
+                      }
+                    } catch {}
+                    return (
+                      <span className="inline-block bg-gray-700 px-3 py-1 rounded">
+                        {m.text}
+                      </span>
+                    );
+                  })()
                 )}
               </div>
             ))
           )}
         </div>
 
-        {/* Input */}
+        {/* Input Box */}
         <div className="flex items-center gap-2 px-4 py-3 border-t">
           <button className="p-2 text-xl text-gray-600">➕</button>
           <input
