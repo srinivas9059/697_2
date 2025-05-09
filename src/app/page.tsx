@@ -141,11 +141,11 @@ export default function ChatPage() {
     return toolCache!.filter((t) => {
       const tt = (t.task_type ?? "").toLowerCase();
       const tags = Array.isArray(t.tags)
-        ? t.tags.map((x) => x.toLowerCase())
+        ? t.tags.map((x: string) => x.toLowerCase())
         : [];
 
       return parts.some(
-        (p) => tt.includes(p) || tags.some((tag) => tag.includes(p))
+        (p) => tt.includes(p) || tags.some((tag: string) => tag.includes(p))
       );
     });
   }
