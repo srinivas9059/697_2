@@ -325,7 +325,10 @@ export default function ChatPage() {
         text: JSON.stringify({ type: "welcome_menu" }),
         timestamp: Date.now(),
       };
-      addMessage(userId, currentId, welcomeToolsMsg).catch(console.error);
+      if (userId && currentId) {
+        addMessage(userId, currentId, welcomeToolsMsg).catch(console.error);
+      }
+
       // 2) Update the conversations state so the UI shows the new message
       setConversations((prev) =>
         prev.map((c) =>
