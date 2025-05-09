@@ -29,7 +29,8 @@ type ChatStage =
   | "onboarding" // right after “New Chat”
   | "awaitStartConfirm" // waiting for Yes/No to “start picking”
   | "awaitTaskPrompt"
-  | "awaitLLMPreferences" // waiting for the user’s task description
+  | "awaitLLMPreferences"
+  | "awaitHuggingfacePrompt" // waiting for the user’s task description
   | "showLLMs" // you just displayed LLM cards
   | "awaitLLMAction" // waiting for “More LLMs” / “I Have Preferences” / “Do Tools?” / “Done”
   | "showTools" // you just displayed tool cards
