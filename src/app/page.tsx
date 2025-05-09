@@ -1,6 +1,6 @@
 // src/app/page.tsx
 "use client";
-
+import { LLMOptions } from "../components/LLMOptions";
 import { useEffect, useState } from "react";
 import { signOut, onAuthStateChanged } from "firebase/auth";
 import { auth } from "../firebase";
@@ -28,7 +28,8 @@ type ChatStage =
   | "idle" // normal general chat mode
   | "onboarding" // right after “New Chat”
   | "awaitStartConfirm" // waiting for Yes/No to “start picking”
-  | "awaitTaskPrompt" // waiting for the user’s task description
+  | "awaitTaskPrompt"
+  | "awaitLLMPreferences" // waiting for the user’s task description
   | "showLLMs" // you just displayed LLM cards
   | "awaitLLMAction" // waiting for “More LLMs” / “I Have Preferences” / “Do Tools?” / “Done”
   | "showTools" // you just displayed tool cards
@@ -39,12 +40,249 @@ export default function ChatPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   // inside ChatPage, before the return:
   const currentChat = conversations.find((c) => c.id === currentId);
   const messages = currentChat?.messages ?? [];
   const [stage, setStage] = useState<ChatStage>("onboarding");
+  // ─── LLM menu state & handlers ─────────────────
+  const [llmOffset, setLlmOffset] = useState(3);
+  // Remember the very latest batch of models you showed
+  const [initialModels, setInitialModels] = useState<any[]>([]);
+  const [lastPrompt, setLastPrompt] = useState<string | null>(null);
+  const [toolList, setToolList] = useState<any[]>([]); // full filtered list
+  const [toolOffset, setToolOffset] = useState(0); // how many we’ve shown so far
+  const [allTools, setAllTools] = useState<any[] | null>(null);
+  const [cachedCategory, setCachedCategory] = useState<string | null>(null);
+
+  let toolCache: any[] | null = null;
+  // Show 3 more LLMs
+  async function handleShowMoreLLMs() {
+    if (!lastPrompt || !userId || !currentId) return;
+
+    setLoading(true);
+    try {
+      // 1) classify again (or cache the category from the first run)
+      const category = cachedCategory ?? (await classifyViaApi(lastPrompt));
+      if (!cachedCategory) setCachedCategory(category);
+
+      // 2) compute new slice: [oldOffset, oldOffset + 3)
+      const nextOffset = llmOffset + 3;
+      // fetch enough picks to cover both old + new
+      const allPicks = await getLLMsByCategory(category, nextOffset);
+      // isolate *only* the new batch
+      const newBatch = allPicks.slice(llmOffset, nextOffset);
+
+      // 3) update offset for next time
+      setLlmOffset(nextOffset);
+
+      // 4) send just the new batch as a new message
+      const cardMsg: Message = {
+        role: "ai",
+        text: JSON.stringify({
+          type: "llm_suggestions",
+          category,
+          models: newBatch,
+        }),
+        timestamp: Date.now(),
+      };
+
+      await addMessage(userId, currentId, cardMsg);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentId ? { ...c, messages: [...c.messages, cardMsg] } : c
+        )
+      );
+    } catch (err) {
+      console.error("Error fetching more LLMs:", err);
+    } finally {
+      setLoading(false);
+    }
+  }
+  async function fetchAndFilterTools(category: string) {
+    // load + sanitize only once
+    if (toolCache === null) {
+      const raw = await fetch("/ai_tool_cards.json").then((r) => r.text());
+      const clean = raw.replace(/\bNaN\b/g, "null");
+
+      toolCache = JSON.parse(clean);
+    }
+
+    // break category into simple keywords
+    const parts = category
+      .split("/")
+      .map((p) => p.trim().split(" ")[0].toLowerCase());
+
+    // filter cached array
+    return toolCache.filter((t) => {
+      const tt = (t.task_type ?? "").toLowerCase();
+      const tags = Array.isArray(t.tags)
+        ? t.tags.map((x) => x.toLowerCase())
+        : [];
+
+      return parts.some(
+        (p) => tt.includes(p) || tags.some((tag) => tag.includes(p))
+      );
+    });
+  }
+  // Ask the user for preferences
+  function handleHavePreferences() {
+    setStage("awaitLLMPreferences");
+    // send a follow-up bot message:
+    const botMsg: Message = {
+      role: "ai",
+      text: "Sure—what matters most to you? (e.g. cost, open-source, privacy)",
+      timestamp: Date.now(),
+    };
+    addMessage(userId!, currentId!, botMsg).catch(console.error);
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === currentId ? { ...c, messages: [...c.messages, botMsg] } : c
+      )
+    );
+  }
+
+  // Trigger the Tool-Recommendation flow
+  // … top‐of‐component state unmodified …
+
+  // 1) First 3 tools (clearing old tool messages)
+  async function handleShowTools() {
+    if (!lastPrompt || !userId || !currentId) return;
+
+    setStage("awaitToolAction");
+    setLoading(true);
+
+    try {
+      // 1. Classify only once per prompt
+      const category = cachedCategory ?? (await classifyViaApi(lastPrompt));
+      if (!cachedCategory) setCachedCategory(category);
+
+      // 2. Load & filter your cached JSON
+      const filtered = await fetchAndFilterTools(category);
+      setToolList(filtered);
+      setToolOffset(3);
+
+      // 3. Remove any prior tool_suggestions messages
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentId
+            ? {
+                ...c,
+                messages: c.messages.filter((m) => {
+                  try {
+                    return JSON.parse(m.text).type !== "tool_suggestions";
+                  } catch {
+                    return true;
+                  }
+                }),
+              }
+            : c
+        )
+      );
+
+      // 4. Send the first 3 tools
+      const firstBatch = filtered.slice(0, 3);
+      console.log("show first tool batch", firstBatch);
+
+      const toolMsg: Message = {
+        role: "ai",
+        text: JSON.stringify({
+          type: "tool_suggestions",
+          category,
+          tools: firstBatch,
+        }),
+        timestamp: Date.now(),
+      };
+
+      await addMessage(userId, currentId, toolMsg);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentId ? { ...c, messages: [...c.messages, toolMsg] } : c
+        )
+      );
+    } catch (err) {
+      console.error("Failed to load tools:", err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // 2) More Tools (only if there’s something new)
+  function handleMoreTools() {
+    if (toolOffset >= toolList.length) return; // nothing left
+    const next = Math.min(toolOffset + 3, toolList.length);
+    const batch = toolList.slice(toolOffset, next);
+    setToolOffset(next);
+
+    if (batch.length === 0) return;
+
+    console.log("show more tool batch", batch);
+    const toolMsg: Message = {
+      role: "ai",
+      text: JSON.stringify({
+        type: "tool_suggestions",
+        tools: batch,
+      }),
+      timestamp: Date.now(),
+    };
+
+    addMessage(userId!, currentId!, toolMsg);
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === currentId ? { ...c, messages: [...c.messages, toolMsg] } : c
+      )
+    );
+  }
+
+  // 3) Done button
+  function handleToolDone() {
+    setStage("idle");
+    const botMsg: Message = {
+      role: "ai",
+      text: "Alright—switching to general chat. Let me know if you want to revisit your recommendations!",
+      timestamp: Date.now(),
+    };
+    addMessage(userId!, currentId!, botMsg);
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === currentId ? { ...c, messages: [...c.messages, botMsg] } : c
+      )
+    );
+  }
+
+  // Exit back to general chat
+  function handleDone() {
+    setStage("idle");
+    const botMsg: Message = {
+      role: "ai",
+      text: "Okay, switching back to general chat. Let me know if you want to pick another LLM!",
+      timestamp: Date.now(),
+    };
+    addMessage(userId!, currentId!, botMsg).catch(console.error);
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === currentId ? { ...c, messages: [...c.messages, botMsg] } : c
+      )
+    );
+  }
+
+  // ────────────────────────────────────────────────
+  function isToolCardMessage(m: Message) {
+    try {
+      return JSON.parse(m.text).type === "tool_suggestions";
+    } catch {
+      return false;
+    }
+  }
+  useEffect(() => {
+    fetch("/ai_tool_cards.json")
+      .then((r) => r.text())
+      .then((raw) => raw.replace(/\bNaN\b/g, "null"))
+      .then((clean) => setAllTools(JSON.parse(clean)))
+      .catch(console.error);
+  }, []);
 
   // 2. Onboarding Sequence
   useEffect(() => {
@@ -167,13 +405,25 @@ export default function ChatPage() {
     }
 
     // ─── Stage 2: Task Prompt → LLM Suggestions ────────────────
+    // ─── Stage 2: Task Prompt → LLM Suggestions ────────────────
     if (stage === "awaitTaskPrompt") {
+      // 1) remember what they asked
+      setLastPrompt(text);
+      // reset “Show More” pagination
+      setLlmOffset(3);
+
+      // 2) move into the LLM‐cards stage
       setStage("awaitLLMAction");
 
       try {
+        // 3) classify & fetch the top 3
         const category = await classifyViaApi(text);
         const llms = await getLLMsByCategory(category, 3);
 
+        // 4) stash these for later (preferences flow)
+        setInitialModels(llms);
+
+        // 5) package into a card message
         const cardMsg: Message = {
           role: "ai",
           text: JSON.stringify({
@@ -184,6 +434,7 @@ export default function ChatPage() {
           timestamp: Date.now(),
         };
 
+        // 6) persist & display
         await addMessage(userId, currentId, cardMsg);
         setConversations((prev) =>
           prev.map((c) =>
@@ -206,6 +457,65 @@ export default function ChatPage() {
         );
       }
 
+      return;
+    }
+
+    // ─── Stage 2.5: Preferences branch ─────────────────────────
+    if (stage === "awaitLLMPreferences") {
+      // 1) capture what the user typed
+      const prefs = text;
+
+      // 2) build a comparison prompt
+      const systemPrompt =
+        "You are an expert at matching LLMs to user preferences.";
+      const userContent = `
+User preferences: ${prefs}
+
+Here are the models I previously recommended:
+${initialModels
+  .map((m, i) => `${i + 1}. ${m.title} — ${m.description}`)
+  .join("\n")}
+
+Question: Which of these best fits the user’s preferences, and why?
+If there is another model in our catalog that fits even better, please recommend it briefly.
+`.trim();
+
+      // 3) send it to your single /api/classify chat route
+      const res = await fetch("/api/classify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userContent },
+          ],
+        }),
+      });
+
+      // 4) read or fallback
+      let replyText: string;
+      if (!res.ok) {
+        replyText = "⚠️ Sorry, couldn’t process preferences. Try again?";
+      } else {
+        const data = await res.json();
+        replyText = data.text;
+      }
+
+      // 5) append that comparison reply
+      const cmpMsg: Message = {
+        role: "ai",
+        text: replyText,
+        timestamp: Date.now(),
+      };
+      await addMessage(userId!, currentId!, cmpMsg);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentId ? { ...c, messages: [...c.messages, cmpMsg] } : c
+        )
+      );
+
+      // 6) go back to showing the 4-button menu
+      setStage("awaitLLMAction");
       return;
     }
 
@@ -324,6 +634,7 @@ export default function ChatPage() {
             </div>
           ))}
         </div>
+
         {/* Logout */}
         <div className="mt-auto pt-4 border-t border-gray-700 text-center">
           <button
@@ -343,7 +654,6 @@ export default function ChatPage() {
         </header>
 
         <div className="flex-1 p-4 overflow-y-auto">
-          +{" "}
           {messages.length === 0 ? (
             <p className="text-gray-400">💬 Conversation will appear here...</p>
           ) : (
@@ -355,37 +665,98 @@ export default function ChatPage() {
                 }`}
               >
                 {isLLMCardMessage(m) ? (
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    {JSON.parse(m.text).models.map((model: any, j: number) => (
-                      <div
-                        key={j}
-                        className="bg-gray-800 text-white p-4 rounded-lg shadow-lg border border-gray-700"
-                      >
-                        <h2 className="font-bold text-lg mb-1">
-                          {model.title}
-                        </h2>
-                        <p className="text-sm text-gray-300 mb-2">
-                          {model.description}
-                        </p>
-                        <div className="text-xs text-gray-400 mb-1">
-                          <strong>Task:</strong> {model.task_type}
-                        </div>
-                        <div className="text-xs text-gray-400 mb-2">
-                          <strong>Tags:</strong>{" "}
-                          {model.tags?.slice(0, 3).join(", ") || "None"}
-                        </div>
-                        <a
-                          href={model.link}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-400 hover:underline text-sm"
+                  <>
+                    {/* LLM suggestion cards */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {JSON.parse(m.text).models.map(
+                        (model: any, j: number) => (
+                          <div
+                            key={j}
+                            className="bg-gray-800 text-white p-4 rounded-lg shadow-lg border border-gray-700"
+                          >
+                            <h2 className="font-bold text-lg mb-1">
+                              {model.title}
+                            </h2>
+                            <p className="text-sm text-gray-300 mb-2">
+                              {model.description}
+                            </p>
+                            <div className="text-xs text-gray-400 mb-1">
+                              <strong>Task:</strong> {model.task_type}
+                            </div>
+                            <div className="text-xs text-gray-400 mb-2">
+                              <strong>Tags:</strong>{" "}
+                              {model.tags?.slice(0, 3).join(", ") || "None"}
+                            </div>
+                            <a
+                              href={model.link}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-400 hover:underline text-sm"
+                            >
+                              ↗ Visit Website
+                            </a>
+                          </div>
+                        )
+                      )}
+                    </div>
+
+                    {/* Four‐button menu for LLM flow */}
+                    {stage === "awaitLLMAction" && (
+                      <LLMOptions
+                        onShowMore={handleShowMoreLLMs}
+                        onPrefs={handleHavePreferences}
+                        onTools={handleShowTools}
+                        onDone={handleDone}
+                      />
+                    )}
+                  </>
+                ) : isToolCardMessage(m) ? (
+                  <>
+                    {/* Tool suggestion cards */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {JSON.parse(m.text).tools.map((tool: any, j: number) => (
+                        <div
+                          key={j}
+                          className="bg-gray-800 text-white p-4 rounded-lg shadow-lg border border-gray-700"
                         >
-                          ↗ Visit Website
-                        </a>
+                          <h3 className="font-bold text-lg mb-1">
+                            {tool.name}
+                          </h3>
+                          <p className="text-sm text-gray-300 mb-2">
+                            {tool.description}
+                          </p>
+                          <a
+                            href={tool.link}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-400 hover:underline text-sm"
+                          >
+                            ↗ Visit Website
+                          </a>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Two‐button menu for Tool flow */}
+                    {stage === "awaitToolAction" && (
+                      <div className="flex flex-wrap gap-3 mt-4">
+                        <button
+                          onClick={handleMoreTools}
+                          className="flex items-center space-x-2 px-4 py-1.5 rounded-2xl border border-gray-500 text-white hover:brightness-90"
+                        >
+                          More Tools
+                        </button>
+                        <button
+                          onClick={handleToolDone}
+                          className="flex items-center space-x-2 px-4 py-1.5 rounded-2xl text-red-400 hover:brightness-90"
+                        >
+                          Done
+                        </button>
                       </div>
-                    ))}
-                  </div>
+                    )}
+                  </>
                 ) : (
+                  // Regular text messages
                   <span className="inline-block bg-gray-700 px-3 py-1 rounded">
                     {m.text}
                   </span>
