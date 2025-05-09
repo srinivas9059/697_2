@@ -138,7 +138,7 @@ export default function ChatPage() {
       .map((p) => p.trim().split(" ")[0].toLowerCase());
 
     // filter cached array
-    return toolCache.filter((t) => {
+    return toolCache!.filter((t) => {
       const tt = (t.task_type ?? "").toLowerCase();
       const tags = Array.isArray(t.tags)
         ? t.tags.map((x) => x.toLowerCase())
