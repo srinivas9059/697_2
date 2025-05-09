@@ -16,6 +16,7 @@ import {
   updateDoc,
   deleteDoc,
   Timestamp,
+  arrayUnion,
 } from "firebase/firestore";
 import { auth, db } from "../firebase";
 
@@ -24,6 +25,17 @@ export interface Message {
   role: "user" | "ai";
   text: string;
   timestamp: number;
+}
+export async function addMessageToChat(chatId: string, message: Message) {
+  const chatRef = doc(
+    db,
+    "users",
+    auth.currentUser!.uid,
+    "conversations",
+    chatId
+  );
+  // or wherever your chats actually live
+  await updateDoc(chatRef, { messages: arrayUnion(message) });
 }
 
 export interface Conversation {

@@ -15,6 +15,7 @@ import type { Conversation, Message } from "../lib/firestore";
 import { useRouter } from "next/navigation";
 import { classifyViaApi } from "../lib/classify";
 import { getLLMsByCategory } from "../lib/llm-utils";
+import { addMessageToChat } from "../lib/firestore";
 
 function isLLMCardMessage(m: Message) {
   try {
@@ -23,6 +24,15 @@ function isLLMCardMessage(m: Message) {
     return false;
   }
 }
+type ChatStage =
+  | "idle" // normal general chat mode
+  | "onboarding" // right after “New Chat”
+  | "awaitStartConfirm" // waiting for Yes/No to “start picking”
+  | "awaitTaskPrompt" // waiting for the user’s task description
+  | "showLLMs" // you just displayed LLM cards
+  | "awaitLLMAction" // waiting for “More LLMs” / “I Have Preferences” / “Do Tools?” / “Done”
+  | "showTools" // you just displayed tool cards
+  | "awaitToolAction"; // waiting for “More Tools” / “Done”
 
 export default function ChatPage() {
   const router = useRouter();
@@ -34,6 +44,34 @@ export default function ChatPage() {
   // inside ChatPage, before the return:
   const currentChat = conversations.find((c) => c.id === currentId);
   const messages = currentChat?.messages ?? [];
+  const [stage, setStage] = useState<ChatStage>("onboarding");
+
+  // 2. Onboarding Sequence
+  useEffect(() => {
+    if (stage === "onboarding" && currentChat && userId) {
+      const welcomeMsg: Message = {
+        role: "ai",
+        text: "Welcome! Are you ready to start picking the perfect LLM for your task?",
+        timestamp: Date.now(),
+      };
+
+      // 1) Persist it to Firestore using your existing helper
+      addMessage(userId, currentChat.id, welcomeMsg).catch(console.error);
+
+      // 2) Update the conversations state so the UI shows the new message
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentChat.id
+            ? { ...c, messages: [...c.messages, welcomeMsg] }
+            : c
+        )
+      );
+
+      // 3) Advance to the next stage
+      setStage("awaitStartConfirm");
+    }
+  }, [stage, currentChat, userId, addMessage, setConversations]);
+
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
       if (user) {
@@ -56,21 +94,29 @@ export default function ChatPage() {
     if (!userId) return;
     const name = `Chat ${conversations.length + 1}`;
     const id = await createConversation(userId, name);
+
+    // 1) Add it to state
     setConversations([
       ...conversations,
       { id, name, createdAt: Date.now(), messages: [] },
     ]);
     setCurrentId(id);
+
+    // 2) Reset the stage so onboarding runs again
+    setStage("onboarding");
+
+    // 3) Clear the input
     setInput("");
   }
 
   async function handleSend() {
-    if (!input.trim() || !userId || !currentId) return;
+    const text = input.trim();
+    if (!text || !userId || !currentId) return;
 
-    // 1) user message
+    // 1) Persist the user's message
     const userMsg: Message = {
       role: "user",
-      text: input,
+      text,
       timestamp: Date.now(),
     };
     await addMessage(userId, currentId, userMsg);
@@ -79,47 +125,148 @@ export default function ChatPage() {
         c.id === currentId ? { ...c, messages: [...c.messages, userMsg] } : c
       )
     );
+
+    // 2) Clear the input immediately
     setInput("");
-    setLoading(true);
 
-    try {
-      // 2) classify + fetch
-      const category = await classifyViaApi(input);
-      const llms = await getLLMsByCategory(category, 3);
+    // ─── Stage 1: Onboarding Yes/No ──────────────────────────────
+    if (stage === "awaitStartConfirm") {
+      const lc = text.toLowerCase();
+      let reply: Message;
 
-      // 3) card message
-      const cardMsg: Message = {
-        role: "ai",
-        text: JSON.stringify({
-          type: "llm_suggestions",
-          category,
-          models: llms,
-        }),
-        timestamp: Date.now(),
-      };
+      if (lc === "yes") {
+        setStage("awaitTaskPrompt");
+        reply = {
+          role: "ai",
+          text: "Great! What task or prompt do you have in mind?",
+          timestamp: Date.now(),
+        };
+      } else if (lc === "no") {
+        setStage("idle");
+        reply = {
+          role: "ai",
+          text: "Alright, we’re now in general chat mode—ask me anything, or say “yes” anytime to start picking an LLM!",
+          timestamp: Date.now(),
+        };
+      } else {
+        // didn’t understand
+        reply = {
+          role: "ai",
+          text: "Sorry, I didn’t catch that—please reply “yes” or “no.”",
+          timestamp: Date.now(),
+        };
+      }
 
-      // 4) save + append
-      await addMessage(userId, currentId, cardMsg);
+      await addMessage(userId, currentId, reply);
       setConversations((prev) =>
         prev.map((c) =>
-          c.id === currentId ? { ...c, messages: [...c.messages, cardMsg] } : c
+          c.id === currentId ? { ...c, messages: [...c.messages, reply] } : c
         )
       );
-    } catch (e) {
-      const errMsg: Message = {
-        role: "ai",
-        text: "⚠️ Something went wrong fetching LLM recommendations.",
-        timestamp: Date.now(),
-      };
-      await addMessage(userId, currentId, errMsg);
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === currentId ? { ...c, messages: [...c.messages, errMsg] } : c
-        )
-      );
+      return;
     }
 
-    setLoading(false);
+    // ─── Stage 2: Task Prompt → LLM Suggestions ────────────────
+    if (stage === "awaitTaskPrompt") {
+      setStage("awaitLLMAction");
+
+      try {
+        const category = await classifyViaApi(text);
+        const llms = await getLLMsByCategory(category, 3);
+
+        const cardMsg: Message = {
+          role: "ai",
+          text: JSON.stringify({
+            type: "llm_suggestions",
+            category,
+            models: llms,
+          }),
+          timestamp: Date.now(),
+        };
+
+        await addMessage(userId, currentId, cardMsg);
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === currentId
+              ? { ...c, messages: [...c.messages, cardMsg] }
+              : c
+          )
+        );
+      } catch (err) {
+        const errMsg: Message = {
+          role: "ai",
+          text: "⚠️ Sorry, I couldn’t fetch LLM recommendations.",
+          timestamp: Date.now(),
+        };
+        await addMessage(userId, currentId, errMsg);
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === currentId ? { ...c, messages: [...c.messages, errMsg] } : c
+          )
+        );
+      }
+
+      return;
+    }
+
+    // ─── Stage 3: General Chat Mode ──────────────────────────────
+    if (stage === "idle") {
+      // inside handleSend, stage === "idle":
+      // inside handleSend(), when stage === "idle"
+      setLoading(true);
+
+      // Build the chat history payload
+      const history = (
+        conversations.find((c) => c.id === currentId)?.messages ?? []
+      )
+        .map((m) => ({ role: m.role, content: m.text }))
+        .concat({ role: "user", content: text });
+
+      // Send to the same /api/classify route, but now with messages
+      const res = await fetch("/api/classify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: history }),
+      });
+
+      // 🔧 Harden here:
+      let aiText: string;
+      if (!res.ok) {
+        // Safely consume any JSON error or fallback to text
+        let errorPayload: any;
+        try {
+          errorPayload = await res.json();
+        } catch {
+          errorPayload = await res.text();
+        }
+        console.error("Chat API error:", res.status, errorPayload);
+        aiText = "⚠️ Sorry, something went wrong. Please try again.";
+      } else {
+        // Only parse JSON if status is OK
+        const data = await res.json();
+        aiText = data.text;
+      }
+
+      setLoading(false);
+
+      // Append the AI reply as usual
+      const botMsg: Message = {
+        role: "ai",
+        text: aiText,
+        timestamp: Date.now(),
+      };
+      await addMessage(userId, currentId, botMsg);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentId ? { ...c, messages: [...c.messages, botMsg] } : c
+        )
+      );
+
+      return;
+    }
+
+    // ─── Other stages (awaitLLMAction / awaitToolAction) ─────────
+    // Leave these to your button‐click handlers—no default behavior here.
   }
 
   async function handleRename(id: string) {
